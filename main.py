@@ -7,11 +7,12 @@ from google.cloud import firestore, storage
 
 app = Flask(__name__)
 
-# Keep using BUCKET_NAME from environment as before
+# Use BUCKET_NAME from env as before
 bucket = storage.Client().bucket(os.getenv("BUCKET_NAME"))
 db = firestore.Client()
+COL = "genai_history"  # Firestore collection for all history
 
-# ——— Existing CRUD endpoints ———
+# ——— CRUD endpoints ———
 
 @app.route("/records", methods=["POST"])
 def create_record():
@@ -22,31 +23,48 @@ def create_record():
         return jsonify({"error": "prompt and result are required"}), 400
 
     doc_id = str(uuid.uuid4())
-    record = {"id": doc_id, "prompt": prompt, "result": result}
-    db.collection("genai_history").document(doc_id).set(record)
-    return jsonify(record), 201
+    rec = {"id": doc_id, "prompt": prompt, "result": result}
+    db.collection(COL).document(doc_id).set(rec)
+    return jsonify(rec), 201
 
 @app.route("/records", methods=["GET"])
 def list_records():
-    docs = db.collection("genai_history").stream()
+    docs = db.collection(COL).stream()
     return jsonify([d.to_dict() for d in docs]), 200
 
 @app.route("/records/<record_id>", methods=["GET"])
 def get_record(record_id):
-    doc = db.collection("genai_history").document(record_id).get()
+    doc = db.collection(COL).document(record_id).get()
     if not doc.exists:
         return jsonify({"error": "not found"}), 404
     return jsonify(doc.to_dict()), 200
 
+@app.route("/records/<record_id>", methods=["PUT"])
+def update_record(record_id):
+    payload = request.get_json(force=True)
+    updates = {}
+    if "prompt" in payload:
+        updates["prompt"] = payload["prompt"]
+    if "result" in payload:
+        updates["result"] = payload["result"]
+    if not updates:
+        return jsonify({"error": "nothing to update"}), 400
+
+    doc_ref = db.collection(COL).document(record_id)
+    if not doc_ref.get().exists:
+        return jsonify({"error": "not found"}), 404
+    doc_ref.update(updates)
+    return jsonify(doc_ref.get().to_dict()), 200
+
 @app.route("/records/<record_id>", methods=["DELETE"])
 def delete_record(record_id):
-    doc_ref = db.collection("genai_history").document(record_id)
+    doc_ref = db.collection(COL).document(record_id)
     if not doc_ref.get().exists:
         return jsonify({"error": "not found"}), 404
     doc_ref.delete()
     return ("", 204)
 
-# ——— New Pub/Sub push endpoint ———
+# ——— Pub/Sub push ingestion ———
 
 @app.route("/history", methods=["POST"])
 def history_push():
@@ -54,8 +72,8 @@ def history_push():
     if not envelope or "message" not in envelope:
         return jsonify({"error": "Invalid Pub/Sub message format"}), 400
 
-    message = envelope["message"]
-    data_b64 = message.get("data")
+    msg = envelope["message"]
+    data_b64 = msg.get("data")
     if not data_b64:
         return jsonify({"error": "No data in Pub/Sub message"}), 400
 
@@ -64,7 +82,7 @@ def history_push():
     except Exception as e:
         return jsonify({"error": f"Failed to decode data: {e}"}), 400
 
-    # Build and store history record
+    # Build the history record
     doc_id = str(uuid.uuid4())
     record = {
         "id":        doc_id,
@@ -73,7 +91,9 @@ def history_push():
         "response":  payload.get("response"),
         "timestamp": firestore.SERVER_TIMESTAMP
     }
-    db.collection("genai_history").document(doc_id).set(record)
+
+    # Save to Firestore
+    db.collection(COL).document(doc_id).set(record)
     return ("", 204)
 
 if __name__ == "__main__":
