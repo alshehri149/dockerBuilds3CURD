@@ -1,19 +1,10 @@
-# Use the official lightweight Python image.
-# https://hub.docker.com/_/python
-FROM python:3.9-slim-buster
+FROM python:3.13-slim
 
-# Allow statements and log messages to immediately appear in the Cloud Run logs
-ENV PYTHONUNBUFFERED True
-
-# Copy local code to the container image
 WORKDIR /app
-COPY . .
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install production dependencies.
-RUN pip install -r requirements.txt
+COPY main.py .
 
-# Service listens on port 8080 by default.
-# This port is exposed automatically by Cloud Run.
 ENV PORT 8080
-
-CMD ["python", "main.py"]
+CMD ["gunicorn", "main:app", "-b", "0.0.0.0:8080"]
