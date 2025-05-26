@@ -9,7 +9,7 @@ from google.cloud import firestore, storage
 app = Flask(__name__)
 
 # Use BUCKET_NAME from env as before
-bucket = storage.Client().bucket(os.getenv("BUCKET_NAME"), 'coe558-genai-media')
+bucket = storage.Client().bucket(os.getenv("BUCKET_NAME"))
 db = firestore.Client()
 COL = "genai_history"  # Firestore collection for all history
 
@@ -114,6 +114,72 @@ def generate_content():
         return corsify(jsonify({
             "error": f"Internal server error: {str(e)}"
         })), 500
+
+# ——— NEW: Image serving endpoint ———
+
+@app.route("/images/<path:filename>", methods=["GET"])
+def serve_image(filename):
+    """
+    Serve images directly from Google Cloud Storage bucket.
+    This allows the frontend to request images without needing to construct URLs.
+    """
+    try:
+        print(f"Image request for: {filename}")
+        
+        # Ensure filename is safe and includes the generated/ prefix if not already present
+        if not filename.startswith('generated/'):
+            filename = f"generated/{filename}"
+        
+        print(f"Looking for blob: {filename}")
+        
+        # Get the blob from the bucket
+        blob = bucket.blob(filename)
+        
+        if not blob.exists():
+            print(f"Image not found: {filename}")
+            # List available files for debugging
+            try:
+                blobs = list(bucket.list_blobs(prefix="generated/", max_results=10))
+                available_files = [b.name for b in blobs]
+                print(f"Available files in generated/: {available_files}")
+            except Exception as e:
+                print(f"Error listing files: {e}")
+            
+            return corsify(jsonify({"error": "Image not found", "requested": filename})), 404
+        
+        print(f"Found blob, downloading: {filename}")
+        
+        # Download the image data
+        image_data = blob.download_as_bytes()
+        
+        # Determine content type based on file extension
+        content_type = "image/png"
+        if filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
+            content_type = "image/jpeg"
+        elif filename.lower().endswith('.gif'):
+            content_type = "image/gif"
+        elif filename.lower().endswith('.webp'):
+            content_type = "image/webp"
+        
+        print(f"Serving image: {filename}, size: {len(image_data)} bytes, type: {content_type}")
+        
+        # Create response with image data
+        response = make_response(image_data)
+        response.headers['Content-Type'] = content_type
+        response.headers['Cache-Control'] = 'public, max-age=3600'  # Cache for 1 hour
+        return corsify(response)
+        
+    except Exception as e:
+        print(f"Error serving image {filename}: {e}")
+        return corsify(jsonify({
+            "error": f"Failed to serve image: {str(e)}",
+            "requested": filename
+        })), 500
+
+@app.route("/images", methods=["OPTIONS"])
+@app.route("/images/<path:filename>", methods=["OPTIONS"])
+def handle_images_options(filename=None):
+    return corsify(make_response("", 204))
 
 # ——— CRUD endpoints ———
 
