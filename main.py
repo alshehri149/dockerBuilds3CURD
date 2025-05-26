@@ -3,6 +3,7 @@ import uuid
 import base64
 import json
 import requests
+import time
 from flask import Flask, request, jsonify, make_response
 from google.cloud import firestore, storage
 
@@ -122,52 +123,135 @@ def serve_image(filename):
     """
     Serve images directly from Google Cloud Storage bucket.
     This allows the frontend to request images without needing to construct URLs.
+    Supports multiple filename patterns for better compatibility.
     """
     try:
         print(f"Image request for: {filename}")
         
-        # Ensure filename is safe and includes the generated/ prefix if not already present
-        if not filename.startswith('generated/'):
-            filename = f"generated/{filename}"
+        # List of possible filename patterns to try
+        filename_patterns = []
         
-        print(f"Looking for blob: {filename}")
+        # If filename already has generated/ prefix, use as-is
+        if filename.startswith('generated/'):
+            filename_patterns.append(filename)
+            base_filename = filename.replace('generated/', '')
+        else:
+            base_filename = filename
+            filename_patterns.append(f"generated/{filename}")
         
-        # Get the blob from the bucket
-        blob = bucket.blob(filename)
+        # Extract potential hash from the filename
+        hash_match = None
+        if '_' in base_filename:
+            # Pattern: image_hash_timestamp.png
+            parts = base_filename.replace('.png', '').split('_')
+            if len(parts) >= 2:
+                hash_match = parts[1]  # Second part should be hash
+        elif '.' in base_filename:
+            # Pattern: hash.png
+            hash_match = base_filename.split('.')[0]
+        else:
+            # Use entire filename as hash
+            hash_match = base_filename
         
-        if not blob.exists():
-            print(f"Image not found: {filename}")
-            # List available files for debugging
+        # Generate additional filename patterns if we have a hash
+        if hash_match:
+            print(f"Extracted hash: {hash_match}")
+            
+            # Try various timestamp patterns (current time ± 60 seconds)
+            current_timestamp = int(time.time())
+            
+            for i in range(120):  # Check 2 minutes range
+                timestamp = current_timestamp - i
+                filename_patterns.extend([
+                    f"generated/image_{hash_match}_{timestamp}.png",
+                    f"generated/{hash_match}_{timestamp}.png",
+                    f"generated/img_{hash_match}_{timestamp}.png"
+                ])
+            
+            # Also try without timestamp
+            filename_patterns.extend([
+                f"generated/{hash_match}.png",
+                f"generated/image_{hash_match}.png",
+                f"generated/img_{hash_match}.png"
+            ])
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_patterns = []
+        for pattern in filename_patterns:
+            if pattern not in seen:
+                unique_patterns.append(pattern)
+                seen.add(pattern)
+        
+        filename_patterns = unique_patterns[:20]  # Limit to first 20 patterns
+        print(f"Trying {len(filename_patterns)} filename patterns")
+        
+        # Try each pattern until we find a match
+        found_blob = None
+        found_filename = None
+        
+        for pattern in filename_patterns:
+            print(f"Checking pattern: {pattern}")
+            blob = bucket.blob(pattern)
+            if blob.exists():
+                found_blob = blob
+                found_filename = pattern
+                print(f"Found match: {pattern}")
+                break
+        
+        if not found_blob:
+            print(f"No matching image found for any pattern")
+            
+            # List available files for debugging (limited to recent files)
             try:
-                blobs = list(bucket.list_blobs(prefix="generated/", max_results=10))
+                print("Listing recent files in generated/ directory...")
+                blobs = list(bucket.list_blobs(prefix="generated/", max_results=20))
                 available_files = [b.name for b in blobs]
-                print(f"Available files in generated/: {available_files}")
+                print(f"Available files: {available_files}")
+                
+                # Try to find files with similar hash
+                if hash_match:
+                    similar_files = [f for f in available_files if hash_match in f]
+                    print(f"Files containing hash '{hash_match}': {similar_files}")
+                
+                return corsify(jsonify({
+                    "error": "Image not found", 
+                    "requested": filename,
+                    "patterns_tried": filename_patterns[:5],  # Show first 5 patterns tried
+                    "available_files": available_files,
+                    "similar_files": similar_files if hash_match else []
+                })), 404
+                
             except Exception as e:
                 print(f"Error listing files: {e}")
-            
-            return corsify(jsonify({"error": "Image not found", "requested": filename})), 404
+                return corsify(jsonify({
+                    "error": "Image not found", 
+                    "requested": filename,
+                    "listing_error": str(e)
+                })), 404
         
-        print(f"Found blob, downloading: {filename}")
+        print(f"Downloading image: {found_filename}")
         
         # Download the image data
-        image_data = blob.download_as_bytes()
+        image_data = found_blob.download_as_bytes()
         
         # Determine content type based on file extension
         content_type = "image/png"
-        if filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
+        if found_filename.lower().endswith(('.jpg', '.jpeg')):
             content_type = "image/jpeg"
-        elif filename.lower().endswith('.gif'):
+        elif found_filename.lower().endswith('.gif'):
             content_type = "image/gif"
-        elif filename.lower().endswith('.webp'):
+        elif found_filename.lower().endswith('.webp'):
             content_type = "image/webp"
         
-        print(f"Serving image: {filename}, size: {len(image_data)} bytes, type: {content_type}")
+        print(f"Serving image: {found_filename}, size: {len(image_data)} bytes, type: {content_type}")
         
         # Create response with image data
         response = make_response(image_data)
         response.headers['Content-Type'] = content_type
         response.headers['Cache-Control'] = 'public, max-age=3600'  # Cache for 1 hour
-        return corsify(response)
+        response.headers['Access-Control-Allow-Origin'] = '*'  # Explicit CORS for images
+        return response
         
     except Exception as e:
         print(f"Error serving image {filename}: {e}")
