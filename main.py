@@ -102,6 +102,19 @@ def generate_content():
             # Log the error but don't fail the request
             print(f"Warning: Failed to save to Firestore: {e}")
         
+        # Handle response based on mode
+        if mode == "image":
+            # Process image URLs to convert API references to actual URLs
+            if genai_result and 'images' in genai_result:
+                for image in genai_result['images']:
+                    if image.get('url', '').startswith('api://'):
+                        # Convert api://filename to actual API endpoint URL
+                        filename = image['url'].replace('api://', '')
+                        # Use the current request's host to build the proper URL
+                        # This ensures it works in any deployment environment
+                        image['url'] = f"{request.scheme}://{request.host}/images/{filename}"
+                        print(f"Converted API reference to: {image['url']}")
+        
         # Return the generation result
         return corsify(jsonify({
             "success": True,
@@ -142,38 +155,50 @@ def serve_image(filename):
         # Extract potential hash from the filename
         hash_match = None
         if '_' in base_filename:
-            # Pattern: image_hash_timestamp.png
+            # Pattern: image_hash_timestamp.png or hash_timestamp.png
             parts = base_filename.replace('.png', '').split('_')
             if len(parts) >= 2:
-                hash_match = parts[1]  # Second part should be hash
+                # Second part should be hash (first 8 chars)
+                potential_hash = parts[1] if parts[0] == 'image' else parts[0]
+                hash_match = potential_hash[:8] if len(potential_hash) >= 8 else potential_hash
         elif '.' in base_filename:
             # Pattern: hash.png
-            hash_match = base_filename.split('.')[0]
+            hash_match = base_filename.split('.')[0][:8]
         else:
-            # Use entire filename as hash
-            hash_match = base_filename
+            # Use entire filename as hash (truncated to 8 chars)
+            hash_match = base_filename[:8]
         
         # Generate additional filename patterns if we have a hash
         if hash_match:
-            print(f"Extracted hash: {hash_match}")
+            print(f"Looking for files with hash: {hash_match}")
             
-            # Try various timestamp patterns (current time ± 60 seconds)
-            current_timestamp = int(time.time())
-            
-            for i in range(120):  # Check 2 minutes range
-                timestamp = current_timestamp - i
-                filename_patterns.extend([
-                    f"generated/image_{hash_match}_{timestamp}.png",
-                    f"generated/{hash_match}_{timestamp}.png",
-                    f"generated/img_{hash_match}_{timestamp}.png"
-                ])
-            
-            # Also try without timestamp
-            filename_patterns.extend([
+            # Generate patterns with different formats
+            base_patterns = [
                 f"generated/{hash_match}.png",
                 f"generated/image_{hash_match}.png",
-                f"generated/img_{hash_match}.png"
-            ])
+                f"generated/img_{hash_match}.png",
+                f"{hash_match}.png",
+                f"image_{hash_match}.png",
+                f"img_{hash_match}.png"
+            ]
+            filename_patterns.extend(base_patterns)
+            
+            # Try with recent timestamps (search last 2 hours)
+            current_timestamp = int(time.time())
+            for i in range(7200):  # Check last 2 hours (7200 seconds)
+                timestamp = current_timestamp - i
+                timestamp_patterns = [
+                    f"generated/image_{hash_match}_{timestamp}.png",
+                    f"generated/{hash_match}_{timestamp}.png",
+                    f"generated/img_{hash_match}_{timestamp}.png",
+                    f"image_{hash_match}_{timestamp}.png",
+                    f"{hash_match}_{timestamp}.png"
+                ]
+                filename_patterns.extend(timestamp_patterns)
+                
+                # Limit to reasonable number of attempts
+                if len(filename_patterns) > 100:
+                    break
         
         # Remove duplicates while preserving order
         seen = set()
@@ -183,29 +208,30 @@ def serve_image(filename):
                 unique_patterns.append(pattern)
                 seen.add(pattern)
         
-        filename_patterns = unique_patterns[:20]  # Limit to first 20 patterns
-        print(f"Trying {len(filename_patterns)} filename patterns")
+        filename_patterns = unique_patterns[:50]  # Limit to first 50 patterns
+        print(f"Trying {len(filename_patterns)} filename patterns for hash: {hash_match}")
         
         # Try each pattern until we find a match
         found_blob = None
         found_filename = None
         
-        for pattern in filename_patterns:
-            print(f"Checking pattern: {pattern}")
+        for i, pattern in enumerate(filename_patterns):
+            if i < 5:  # Log first 5 attempts
+                print(f"Checking pattern {i+1}: {pattern}")
             blob = bucket.blob(pattern)
             if blob.exists():
                 found_blob = blob
                 found_filename = pattern
-                print(f"Found match: {pattern}")
+                print(f"✅ Found match: {pattern}")
                 break
         
         if not found_blob:
-            print(f"No matching image found for any pattern")
+            print(f"❌ No matching image found for any pattern")
             
             # List available files for debugging (limited to recent files)
             try:
                 print("Listing recent files in generated/ directory...")
-                blobs = list(bucket.list_blobs(prefix="generated/", max_results=20))
+                blobs = list(bucket.list_blobs(prefix="generated/", max_results=30))
                 available_files = [b.name for b in blobs]
                 print(f"Available files: {available_files}")
                 
@@ -213,24 +239,35 @@ def serve_image(filename):
                 if hash_match:
                     similar_files = [f for f in available_files if hash_match in f]
                     print(f"Files containing hash '{hash_match}': {similar_files}")
+                    
+                    # If we found similar files, try them directly
+                    if similar_files:
+                        print(f"Trying direct match with similar file: {similar_files[0]}")
+                        direct_blob = bucket.blob(similar_files[0])
+                        if direct_blob.exists():
+                            found_blob = direct_blob
+                            found_filename = similar_files[0]
+                            print(f"✅ Direct match successful: {found_filename}")
                 
-                return corsify(jsonify({
-                    "error": "Image not found", 
-                    "requested": filename,
-                    "patterns_tried": filename_patterns[:5],  # Show first 5 patterns tried
-                    "available_files": available_files,
-                    "similar_files": similar_files if hash_match else []
-                })), 404
+                if not found_blob:
+                    return corsify(jsonify({
+                        "error": "Image not found", 
+                        "requested": filename,
+                        "hash_searched": hash_match,
+                        "patterns_tried": min(5, len(filename_patterns)),
+                        "available_files": available_files[:10],  # Show first 10
+                        "similar_files": similar_files[:5] if hash_match else []
+                    })), 404
                 
             except Exception as e:
                 print(f"Error listing files: {e}")
                 return corsify(jsonify({
-                    "error": "Image not found", 
+                    "error": "Image not found and could not list bucket contents", 
                     "requested": filename,
                     "listing_error": str(e)
                 })), 404
         
-        print(f"Downloading image: {found_filename}")
+        print(f"📥 Downloading image: {found_filename}")
         
         # Download the image data
         image_data = found_blob.download_as_bytes()
@@ -244,7 +281,7 @@ def serve_image(filename):
         elif found_filename.lower().endswith('.webp'):
             content_type = "image/webp"
         
-        print(f"Serving image: {found_filename}, size: {len(image_data)} bytes, type: {content_type}")
+        print(f"✅ Serving image: {found_filename}, size: {len(image_data)} bytes, type: {content_type}")
         
         # Create response with image data
         response = make_response(image_data)
@@ -254,7 +291,7 @@ def serve_image(filename):
         return response
         
     except Exception as e:
-        print(f"Error serving image {filename}: {e}")
+        print(f"❌ Error serving image {filename}: {e}")
         return corsify(jsonify({
             "error": f"Failed to serve image: {str(e)}",
             "requested": filename
